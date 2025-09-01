@@ -52,9 +52,8 @@ To download and run the installer in a single, convenient command, open a termin
 > **Security Warning**: This method pipes a script from the internet directly into a root shell. This is a common practice for installers but carries a security risk. We recommend you inspect the script's source code before running.
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Opselon/Kali-LInux-Nvidia-Installer/main/nvidia-installer-kali.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Opselon/Kali-LInux-Nvidia-Installer/main/nvidia-installer-kali.sh)"
 ```
-*(Note: Please replace the URL above with the raw URL to your final script file.)*
 
 ## Usage (The Guided GUI)
 
