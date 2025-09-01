@@ -1,306 +1,396 @@
-#!/usr/bin/env bash
-#
-# kali-nvidia-installer.sh
-# GUI-assisted, safer NVIDIA driver + optional CUDA installer for Kali Linux (Zenity UI)
-# Author: ChatGPT (for مهراد) — example code for GitHub
-# License: MIT
-#
-# Key features:
-#  - GPU detection (lspci / nvidia-detect)
-#  - Enable contrib & non-free if needed (optional)
-#  - Install kernel headers, dkms, build-essential
-#  - Repo-based NVIDIA install (recommended)
-#  - Optional: NVIDIA .run installer (advanced, warns user)
-#  - Optional: install CUDA (uses repository packages or points to NVIDIA docs)
-#  - Blacklist nouveau and regenerate initramfs
-#  - Detect Secure Boot and help guide module signing / warn about disabling Secure Boot
-#  - Dry-run mode, logging, backup/restore of Xorg configs
-#  - Uninstall option
-#  - Full logging to /var/log/kali-nvidia-installer-YYYYMMDD-HHMM.log
-#
+
+# --- Script Configuration and Constants -------------------------------------
 set -o errexit
 set -o nounset
 set -o pipefail
 
-PROGNAME="$(basename "$0")"
-LOG_DIR="/var/log"
-LOG_FILE="${LOG_DIR}/kali-nvidia-installer-$(date +%Y%m%d-%H%M%S).log"
-DRY_RUN=false
+readonly PROGNAME="$(basename "$0")"
+readonly LOG_DIR="/var/log"
+readonly LOG_FILE="${LOG_DIR}/kali-nvidia-installer-$(date +%Y%m%d-%H%M%S).log"
+readonly MIN_DISK_SPACE_GB=5       # Minimum free space required for base install
+readonly MIN_DISK_SPACE_CUDA_GB=20 # Minimum free space if CUDA is selected
+readonly REQUIRED_REPO="kali-rolling"
+
 ZENITY=$(command -v zenity || true)
 
-# -- Helpers -------------------------------------------------------------------
+# --- ASCII Art Banner --------------------------------------------------------
+readonly BANNER="
+    __   __   __    __     __  .__   __.  _______ .__   __. .___________. _______ .______
+   |  | |  | |  |  |  |   |  | |  \\ |  | |   ____||  \\ |  | |           ||   ____||   _  \\
+   |  | |  | |  |  |  |   |  | |   \\|  | |  |__   |   \\|  | \`---|  |----\`|  |__   |  |_)  |
+.--.  | |  | |  |  |  |   |  | |  . \`  | |   __|  |  . \`  |     |  |     |   __|  |      /
+|  \`--' | |  \`--'  |   |  \`--'  | |  |\\   | |  |____ |  |\\   |     |  |     |  |____ |  |\\  \\----.
+ \______/   \\______/     \\______/  |__| \\__| |_______||__| \\__|     |__|     |_______|| _| \`._____|
+        - K A L I   L I N U X   L E V I A T H A N   E D I T I O N -
+"
+
+# --- Core Helper Functions ----------------------------------------------------
+
+# Centralized logging function.
 log() {
-  local msg="$*"
-  echo "$(date --iso-8601=seconds) | ${msg}" | tee -a "$LOG_FILE"
+    local msg="$*"
+    echo "$(date --iso-8601=seconds) | ${PROGNAME}: ${msg}" | tee -a "$LOG_FILE"
 }
 
+# Centralized error handling and exit function.
 err_exit() {
-  local rc=$1
-  local msg="$2"
-  log "ERROR: $msg (rc=$rc)"
-  if [ -n "$ZENITY" ]; then
-    zenity --error --title="Installer Error" --text="$msg\n\nSee log: $LOG_FILE"
-  else
-    echo "ERROR: $msg"
-  fi
-  exit "$rc"
+    local msg="$1"
+    log "FATAL ERROR: $msg"
+    [ -n "$ZENITY" ] && zenity --error --title="Installer Critical Error" --width=500 --text="A critical error occurred and the installer must exit:\n\n<b>$msg</b>\n\nPlease check the log file for exhaustive details:\n<b>$LOG_FILE</b>"
+    exit 1
 }
 
-run_or_log() {
-  # wrapper so we can honor dry-run
-  if [ "$DRY_RUN" = true ]; then
-    log "[DRY RUN] $*"
-  else
-    log "RUN: $*"
-    eval "$@" 2>&1 | tee -a "$LOG_FILE"
-  fi
-}
-
-ensure_root() {
-  if [ "$EUID" -ne 0 ]; then
-    if [ -n "$ZENITY" ]; then
-      zenity --question --title="Need root" --text="This installer needs root. Launch with sudo?\n(Press OK to re-run with sudo)"
-      if [ $? -eq 0 ]; then
-        exec sudo bash "$0" "$@"
-      else
-        err_exit 2 "Root privileges required."
-      fi
-    else
-      err_exit 2 "Please run as root."
+# Run a command, log it, and exit if it fails.
+run_or_die() {
+    log "EXEC: $*"
+    if ! "$@" >>"$LOG_FILE" 2>&1; then
+        err_exit "The command '$*' failed. Check the log file for details."
     fi
-  fi
+    log "SUCCESS: $*"
 }
 
-ensure_zenity() {
-  if [ -z "$ZENITY" ]; then
-    echo "Zenity not found. Installing (apt)..." | tee -a "$LOG_FILE"
-    apt update -y >>"$LOG_FILE" 2>&1 || true
-    apt install -y zenity dialog -y >>"$LOG_FILE" 2>&1 || err_exit 3 "Failed to install zenity"
-    ZENITY=$(command -v zenity)
-  fi
-}
-
-# -- Detect secure boot -------------------------------------------------------
-detect_secureboot() {
-  if command -v mokutil >/dev/null 2>&1; then
-    local sb
-    sb=$(mokutil --sb-state 2>/dev/null || echo "mokutil-unavailable")
-    echo "$sb"
-  else
-    # fallback via efivarfs presence
-    if [ -d /sys/firmware/efi ]; then
-      echo "efi-present-mok-unknown"
-    else
-      echo "no-efi"
+# Run a long-running command with a graphical progress bar.
+run_with_progress() {
+    local title="$1"
+    shift
+    log "EXEC (Progress): $*"
+    # The subshell and pipe require checking PIPESTATUS to get the real exit code.
+    ( "$@" 2>&1 | tee -a "$LOG_FILE" ) | zenity --progress --title="$title" --text="Running: $*...\n\n(This may take some time. See log for detailed output.)" --pulsate --auto-close --auto-kill --width=700
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+        err_exit "The command '$*' failed during a progress operation. Check the log."
     fi
-  fi
+    log "SUCCESS: $*"
 }
 
-# -- GPU detection ------------------------------------------------------------
-detect_gpu() {
-  log "Detecting GPU(s)..."
-  run_or_log "lspci | grep -i -E 'vga|3d|display' || true"
-  if dpkg -s nvidia-detect >/dev/null 2>&1; then
-    run_or_log "nvidia-detect || true"
-  else
-    log "nvidia-detect not installed (optional)."
-  fi
+# Standardized function for Yes/No questions.
+user_confirm() {
+    local question_text="$1"
+    local title="$2:- Confirmation"
+    zenity --question --title="$title" --width=450 --text="$question_text"
 }
 
-# -- Manage sources (add contrib non-free) -----------------------------------
-enable_nonfree() {
-  log "Ensuring contrib and non-free are in /etc/apt/sources.list"
-  local changed=false
-  # Backup
-  run_or_log "cp -a /etc/apt/sources.list /etc/apt/sources.list.bak-$(date +%s)"
-  # Add 'contrib non-free' if missing for kali-rolling lines
-  if ! grep -E "kali-rolling.*contrib.*non-free" /etc/apt/sources.list >/dev/null 2>&1; then
-    log "Adding contrib non-free to sources.list (only lines matching kali-rolling)."
-    # safe replace: append the components to lines that look like main only
-    if [ "$DRY_RUN" = false ]; then
-      awk '/^deb .*kali-rolling/ {
-             if ($0 !~ /contrib/) { $0 = $0 " contrib non-free non-free-firmware" }
-           }
-           { print }' /etc/apt/sources.list > /tmp/sources.list.new && mv /tmp/sources.list.new /etc/apt/sources.list
-    else
-      log "[DRY RUN] would add contrib non-free to /etc/apt/sources.list"
+# --- Pre-Flight System Analysis Suite -----------------------------------------
+
+_check_root() {
+    log "Verifying root privileges..."
+    [ "$EUID" -eq 0 ] || err_exit "This script requires root privileges. Please run with sudo or as root."
+}
+
+_check_zenity() {
+    log "Verifying Zenity is installed..."
+    if [ -z "$ZENITY" ]; then
+        log "Zenity not found. Attempting emergency installation via apt-get..."
+        apt-get update -y
+        apt-get install -y zenity || err_exit "Failed to auto-install Zenity. Please install it manually ('sudo apt install zenity') and re-run."
+        ZENITY=$(command -v zenity)
+        log "Zenity installed successfully."
     fi
-    changed=true
-  else
-    log "contrib non-free already present."
-  fi
-
-  if [ "$changed" = true ]; then
-    run_or_log "apt update -y || true"
-  fi
 }
 
-# -- Install prerequisites ----------------------------------------------------
-install_prereqs() {
-  # kernel headers, build-essential, dkms, pciutils, wget, ca-certificates
-  local pkgs=(linux-headers-$(uname -r) build-essential dkms pciutils wget ca-certificates gnupg)
-  log "Installing prerequisites: ${pkgs[*]}"
-  run_or_log "apt update -y || true"
-  run_or_log "DEBIAN_FRONTEND=noninteractive apt install -y ${pkgs[*]}"
+_check_internet() {
+    log "Verifying internet connectivity..."
+    if ! ping -c 2 8.8.8.8 >/dev/null 2>&1; then
+        err_exit "No internet connection detected. This installer needs to download packages."
+    fi
 }
 
-# -- Blacklist nouveau --------------------------------------------------------
-blacklist_nouveau_and_update_initramfs() {
-  log "Blacklisting nouveau and updating initramfs"
-  cat <<'EOF' >/etc/modprobe.d/blacklist-nouveau.conf
-# Blacklist nouveau for NVIDIA proprietary driver install
-blacklist nouveau
-options nouveau modeset=0
-EOF
-  run_or_log "update-initramfs -u -k all"
+_check_apt_lock() {
+    log "Verifying APT is not locked..."
+    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+        err_exit "APT is locked by another process. Please close any other package managers (e.g., Synaptic, apt in another terminal) and try again."
+    fi
 }
 
-# -- Install from Kali repos (recommended) -----------------------------------
-install_nvidia_from_repo() {
-  log "Installing NVIDIA driver from Kali repositories (recommended)"
-  run_or_log "apt update -y || true"
-  # Install nvidia-detect (optional) and nvidia-driver
-  run_or_log "DEBIAN_FRONTEND=noninteractive apt install -y nvidia-detect || true"
-  run_or_log "DEBIAN_FRONTEND=noninteractive apt install -y nvidia-driver nvidia-kernel-dkms nvidia-utils || true"
-  # Optional: CUDA toolkit
-  if zenity --question --title="CUDA?" --text="Do you want to install the CUDA toolkit from Kali repos? (optional, can be large)"; then
-    run_or_log "DEBIAN_FRONTEND=noninteractive apt install -y nvidia-cuda-toolkit || true"
-  fi
-  zenity --info --title="Reboot required" --text="The driver package may require a reboot. Reboot now?"
-  if [ $? -eq 0 ]; then
-    run_or_log "reboot -f"
-  fi
+_check_gpu_presence() {
+    log "Scanning for NVIDIA GPU..."
+    if ! lspci | grep -q -i 'vga.*nvidia'; then
+        log "Warning: No NVIDIA GPU detected via lspci."
+        user_confirm "No NVIDIA GPU was automatically detected.\n\nThis is highly unusual. Proceeding may not be useful.\n\nDo you want to continue anyway?" "Hardware Check" \
+            || err_exit "Installation canceled by user. No NVIDIA GPU detected."
+    fi
 }
 
-# -- Install NVIDIA .run (advanced) ------------------------------------------
-install_nvidia_from_run() {
-  log "Advanced: Install using NVIDIA .run installer (not recommended for beginners)."
-  zenity --warning --title="Advanced installer" --text="The .run installer bypasses package manager. Use only if repo driver fails or you need a very specific driver. This can break apt-managed kernel module updates."
-  # Ask user for driver URL or file
-  local url
-  url=$(zenity --entry --title="NVIDIA .run URL or local path" --text="Enter full URL to NVIDIA .run or local path (e.g. /home/user/NVIDIA-Linux-x86_64-XXX.run):")
-  if [ -z "$url" ]; then
-    log "No URL/path provided; aborting .run install."
-    return 1
-  fi
-  local file="/tmp/$(basename "$url")"
-  if [[ "$url" =~ ^https?:// ]]; then
-    run_or_log "wget -O '$file' '$url'"
-    run_or_log "chmod +x '$file'"
-  else
-    file="$url"
-    if [ ! -f "$file" ]; then err_exit 10 "File not found: $file"; fi
-  fi
-  # Switch to text mode: ask user to continue
-  zenity --question --title="Switch to text mode" --text="The system will switch to text multiuser target (no X). Continue?"
-  if [ $? -ne 0 ]; then
-    log "User canceled .run install."
-    return 1
-  fi
-  log "Stopping display manager and switching to text mode."
-  run_or_log "systemctl isolate multi-user.target || true"
-  log "Running: $file --silent --accept-license (installer will run)"
-  run_or_log "$file --silent --accept-license || true"
-  log "Restoring graphical.target"
-  run_or_log "systemctl isolate graphical.target || true"
-  zenity --info --title="Done" --text="If installer succeeded, please reboot."
+_check_secure_boot() {
+    log "Checking Secure Boot status..."
+    if mokutil --sb-state 2>/dev/null | grep -q enabled; then
+        log "Warning: Secure Boot is enabled."
+        zenity --warning --title="Security Warning: Secure Boot Enabled" --width=600 --text="<b>Secure Boot is ACTIVE on this system.</b>\n\nThe NVIDIA driver modules that this script builds (via DKMS) are <b>not cryptographically signed</b> by default. Therefore, they will be <b>BLOCKED</b> from loading by the kernel, and the driver will fail to start.\n\n<b>Your Options:</b>\n1. <b>(Recommended)</b> Exit now, reboot into your UEFI/BIOS, disable Secure Boot, and run this installer again.\n2. Proceed anyway if you are an advanced user who plans to sign the modules manually (MOK)."
+        user_confirm "Do you understand the risks and wish to continue with Secure Boot enabled?" "Secure Boot Warning" \
+            || err_exit "Installation canceled by user due to Secure Boot."
+    fi
 }
 
-# -- Uninstall / Cleanup -----------------------------------------------------
+_check_virtual_machine() {
+    log "Checking for virtualization environment..."
+    local vm
+    vm=$(systemd-detect-virt)
+    if [ "$vm" != "none" ]; then
+        log "Warning: Virtual machine environment '$vm' detected."
+        user_confirm "This script has detected it is running inside a virtual machine (<b>$vm</b>).\n\nInstalling NVIDIA drivers in a VM is a complex topic that usually requires GPU Passthrough (IOMMU) to be configured correctly on the host.\n\nStandard installation will likely fail or have no effect. Do you want to proceed at your own risk?" "Virtualization Detected" \
+            || err_exit "Installation canceled by user due to VM environment."
+    fi
+}
+
+_check_disk_space() {
+    log "Checking available disk space..."
+    local free_space_kb
+    free_space_kb=$(df / --output=avail | tail -n 1)
+    local free_space_gb=$((free_space_kb / 1024 / 1024))
+    if [ "$free_space_gb" -lt "$MIN_DISK_SPACE_GB" ]; then
+        err_exit "Insufficient disk space. You have only ${free_space_gb}GB free, but at least ${MIN_DISK_SPACE_GB}GB is required."
+    fi
+    log "Disk space check passed (${free_space_gb}GB available)."
+}
+
+_check_kali_repo() {
+    log "Checking for 'kali-rolling' repository..."
+    if ! grep -q "^deb .*$REQUIRED_REPO" /etc/apt/sources.list /etc/apt/sources.list.d/*; then
+        err_exit "The required '$REQUIRED_REPO' repository is not configured in your APT sources. This script is designed for Kali Rolling."
+    fi
+}
+
+# Master function to run all pre-flight checks in sequence.
+run_all_pre_flight_checks() {
+    log "--- Starting Pre-Flight System Analysis Suite ---"
+    (
+        echo "0"; echo "# Initializing..."
+        _check_root
+        _check_zenity
+        echo "10"; echo "# Checking Internet Connection..."
+        _check_internet
+        echo "20"; echo "# Checking APT Locks..."
+        _check_apt_lock
+        echo "35"; echo "# Scanning for NVIDIA Hardware..."
+        _check_gpu_presence
+        echo "50"; echo "# Checking Secure Boot Status..."
+        _check_secure_boot
+        echo "65"; echo "# Detecting Virtualization..."
+        _check_virtual_machine
+        echo "80"; echo "# Analyzing Disk Space..."
+        _check_disk_space
+        echo "90"; echo "# Verifying Kali Repository..."
+        _check_kali_repo
+        echo "100"; echo "# All checks passed."
+        sleep 1
+    ) | zenity --progress --title="System Pre-flight Analysis" --auto-close --width=600
+    log "--- System Analysis Complete. All systems nominal. ---"
+}
+
+# --- "Philosopher's Guide" Installation Process -----------------------------
+
+# Step 1: System Upgrade
+step_1_system_upgrade() {
+    zenity --info --title="Installation - Step 1/5" --width=600 --text="<b>Step 1: Full System Synchronization</b>\n\nThe most critical first step, as per official Kali documentation, is to ensure your system is completely up-to-date. This synchronizes your installed kernel with the available kernel headers, preventing build errors.\n\nThis involves two commands:\n1. <b>apt update</b> - Refreshes the list of available packages.\n2. <b>apt full-upgrade</b> - Upgrades all packages, handling dependencies intelligently.\n\nThis process can take a significant amount of time."
+    run_with_progress "Updating package lists (apt update)..." apt-get update -y
+    run_with_progress "Performing full system upgrade (apt full-upgrade)..." apt-get full-upgrade -y
+}
+
+# Step 2: Reboot Check
+step_2_reboot_check() {
+    if [ -f /var/run/reboot-required ]; then
+        log "Reboot required after system upgrade."
+        zenity --info --title="Installation - Action Required" --width=500 --text="The system upgrade has installed a new Linux kernel.\n\nA <b>reboot is now mandatory</b> to boot into this new kernel. The driver installation can only proceed once this is done.\n\nThe installer will now prompt you to reboot."
+        if user_confirm "Click 'Yes' to reboot now.\nClick 'No' to cancel the entire installation." "Reboot Required"; then
+            log "Rebooting system to load new kernel."
+            reboot
+            exit 0
+        else
+            err_exit "Reboot was declined. Cannot safely continue the installation."
+        fi
+    fi
+    log "No reboot required after upgrade."
+}
+
+# Step 3: Install Kernel Headers
+step_3_install_headers() {
+    zenity --info --title="Installation - Step 2/5" --width=600 --text="<b>Step 2: Installing Kernel Headers</b>\n\nThe NVIDIA driver is not a simple application; it's a kernel module. To be loaded by the Linux kernel, it must be compiled specifically for the *exact* version of the kernel you are running.\n\nThis step installs the 'linux-headers' package, which provides the necessary source code and build tools (DKMS - Dynamic Kernel Module Support) to compile the NVIDIA module."
+    local kernel_version
+    kernel_version=$(uname -r)
+    log "Target kernel version is $kernel_version."
+    run_with_progress "Installing linux-headers-$kernel_version..." apt-get install -y "linux-headers-$kernel_version"
+}
+
+# Step 4: Install NVIDIA Drivers
+step_4_install_drivers() {
+    zenity --info --title="Installation - Step 3/5" --width=600 --text="<b>Step 3: Installing the NVIDIA Driver</b>\n\nNow we will install the core NVIDIA packages from the Kali repository.\n\n- <b>nvidia-driver:</b> The main proprietary driver.\n- <b>nvidia-kernel-dkms:</b> This will trigger the automatic compilation of the kernel module you need.\n\nDuring this step, the installer will also automatically create a file to blacklist the default open-source 'nouveau' driver, preventing conflicts."
+    run_with_progress "Installing nvidia-driver and dkms module..." apt-get install -y nvidia-driver nvidia-kernel-dkms
+}
+
+# Step 5: Optional CUDA Installation
+step_5_install_cuda_optional() {
+    zenity --info --title="Installation - Step 4/5" --width=600 --text="<b>Step 4 (Optional): Install NVIDIA CUDA Toolkit</b>\n\nCUDA allows the GPU to be used for general-purpose computing, dramatically accelerating tasks like password cracking (Hashcat), machine learning, and scientific computing.\n\n<b>Warning:</b> The CUDA toolkit is a <b>very large</b> download (many gigabytes). Only install this if you specifically need it."
+    if user_confirm "Do you want to install the NVIDIA CUDA Toolkit?" "Optional Installation"; then
+        log "User chose to install CUDA."
+        _check_disk_space_for_cuda
+        run_with_progress "Installing CUDA Toolkit (nvidia-cuda-toolkit)..." apt-get install -y nvidia-cuda-toolkit
+    else
+        log "User skipped CUDA installation."
+    fi
+}
+
+_check_disk_space_for_cuda() {
+    log "Checking disk space for CUDA..."
+    local free_space_kb
+    free_space_kb=$(df / --output=avail | tail -n 1)
+    local free_space_gb=$((free_space_kb / 1024 / 1024))
+    if [ "$free_space_gb" -lt "$MIN_DISK_SPACE_CUDA_GB" ]; then
+        err_exit "Insufficient disk space for CUDA. You have ${free_space_gb}GB free, but at least ${MIN_DISK_SPACE_CUDA_GB}GB is recommended."
+    fi
+    log "CUDA disk space check passed (${free_space_gb}GB available)."
+}
+
+# Step 6: Final Reboot
+step_6_final_reboot_prompt() {
+    log "Installation process has completed."
+    zenity --info --title="Installation - Step 5/5" --width=500 --text="<b>Installation Complete!</b>\n\nThe NVIDIA driver and all related components have been successfully installed and compiled.\n\nA final reboot is required to unload the old 'nouveau' driver and load the new 'nvidia' driver into the kernel.\n\nAfter rebooting, you can run the 'Verify Installation' option from this script's main menu."
+    if user_confirm "Click 'Yes' to reboot the system now.\nClick 'No' to reboot later manually." "Final Reboot"; then
+        log "Rebooting to finalize installation."
+        reboot
+    fi
+}
+
+# Master installation orchestrator function
+leviathan_install() {
+    log "--- Initiating Leviathan Installation Process ---"
+    if ! user_confirm "You are about to begin the fully automated NVIDIA driver installation. This will upgrade your entire system and install new drivers.\n\nIt is highly recommended to close all other applications.\n\nDo you wish to proceed?" "Confirm Installation"; then
+        log "User aborted installation at confirmation."
+        return
+    fi
+
+    run_all_pre_flight_checks
+    step_1_system_upgrade
+    step_2_reboot_check
+    step_3_install_headers
+    step_4_install_drivers
+    step_5_install_cuda_optional
+    step_6_final_reboot_prompt
+    log "--- Leviathan Installation Process Finished ---"
+}
+
+# --- Deep Dive Verification Suite -------------------------------------------
+
+comprehensive_verification() {
+    log "--- Starting Deep Dive Verification Suite ---"
+    local report="<b>Leviathan Installation Verification Report:</b>\n\n"
+    local all_ok=true
+
+    # 1. DKMS Status
+    log "Verifying DKMS status..."
+    if dkms status 2>/dev/null | grep -q 'nvidia.*installed'; then
+        report+="✅ <b>DKMS Module:</b> OK\n   - The 'nvidia' module is successfully built and installed via DKMS.\n\n"
+    else
+        report+="❌ <b>DKMS Module:</b> FAILED\n   - The 'nvidia' module was NOT found or failed to build in DKMS. This is a critical error.\n\n"
+        all_ok=false
+    fi
+
+    # 2. Kernel Module Loaded
+    log "Verifying kernel module is loaded..."
+    if lsmod | grep -q '^nvidia '; then
+        report+="✅ <b>Kernel Driver:</b> OK\n   - The 'nvidia' kernel module is currently loaded and active.\n\n"
+    else
+        report+="❌ <b>Kernel Driver:</b> FAILED\n   - The 'nvidia' module is NOT loaded. This could be due to Secure Boot or a build error. Check 'dmesg' for errors.\n\n"
+        all_ok=false
+    fi
+
+    # 3. NVIDIA SMI Tool
+    log "Verifying nvidia-smi functionality..."
+    if command -v nvidia-smi &>/dev/null && smi_output=$(nvidia-smi 2>&1); then
+        report+="✅ <b>NVIDIA System Management Interface (nvidia-smi):</b> OK\n   - The command is working and communicating with the driver.\n\n<tt>$smi_output</tt>\n\n"
+    else
+        report+="❌ <b>NVIDIA System Management Interface (nvidia-smi):</b> FAILED\n   - The 'nvidia-smi' command failed to execute. This indicates a severe driver loading issue.\n\n"
+        all_ok=false
+    fi
+
+    # 4. OpenGL Rendering
+    log "Verifying OpenGL rendering..."
+    if ! command -v glxinfo &>/dev/null; then
+        if user_confirm "'glxinfo' command not found. This tool is needed to verify OpenGL acceleration. It's part of the 'mesa-utils' package.\n\nInstall it now?" "Missing Tool"; then
+            run_with_progress "Installing mesa-utils..." apt-get install -y mesa-utils
+        fi
+    fi
+    if command -v glxinfo &>/dev/null; then
+        if glxinfo -B | grep -q "OpenGL renderer string.*NVIDIA"; then
+            report+="✅ <b>OpenGL Acceleration:</b> OK\n   - The system is correctly using the NVIDIA GPU for OpenGL rendering.\n\n"
+        else
+            report+="❌ <b>OpenGL Acceleration:</b> FAILED\n   - The system is NOT using the NVIDIA GPU for OpenGL. It may be falling back to software rendering.\n\n"
+            all_ok=false
+        fi
+    else
+        report+="⚠️ <b>OpenGL Acceleration:</b> UNKNOWN\n   - Could not perform check because 'glxinfo' is not available.\n\n"
+    fi
+
+
+    if [ "$all_ok" = true ]; then
+        zenity --info --title="Verification Passed" --width=800 --height=600 --text="<span size='large'><b>All checks passed. Your NVIDIA driver appears to be fully operational.</b></span>\n\n$report"
+    else
+        zenity --error --title="Verification Failed" --width=800 --height=600 --text="<span size='large' color='red'><b>One or more verification checks failed!</b></span>\n\n$report\n\nPlease review the errors above and consult the log file for detailed troubleshooting information:\n<b>$LOG_FILE</b>"
+    fi
+}
+
+# --- Uninstallation and About Dialogs ---------------------------------------
+
 uninstall_nvidia() {
-  zenity --question --title="Uninstall NVIDIA" --text="Completely remove NVIDIA packages and restore defaults?"
-  if [ $? -ne 0 ]; then
-    log "Uninstall canceled."
-    return 0
-  fi
-  run_or_log "DEBIAN_FRONTEND=noninteractive apt remove --purge -y 'nvidia-*' 'libnvidia-*' nvidia-driver nvidia-kernel-dkms nvidia-utils || true"
-  # restore nouveau
-  if [ -f /etc/modprobe.d/blacklist-nouveau.conf ]; then
-    run_or_log "rm -f /etc/modprobe.d/blacklist-nouveau.conf || true"
-  fi
-  run_or_log "update-initramfs -u -k all || true"
-  zenity --info --title="Uninstalled" --text="NVIDIA packages removed. Reboot recommended."
+    if ! user_confirm "This will completely <b>PURGE</b> all NVIDIA packages from your system and attempt to restore the default 'nouveau' driver.\n\nAre you absolutely sure you want to proceed?" "Confirm Uninstallation"; then
+        log "Uninstall canceled by user."
+        return
+    fi
+    log "--- Starting Full NVIDIA Driver Purge ---"
+    run_with_progress "Purging all nvidia-* packages..." apt-get remove --purge -y '~nnvidia-.*'
+    run_with_progress "Cleaning up orphaned dependencies..." apt-get autoremove -y
+    log "Removing leftover configuration files."
+    run_or_die rm -f /etc/modprobe.d/nvidia-installer-disable-nouveau.conf
+    run_with_progress "Updating initramfs to restore nouveau..." update-initramfs -u
+
+    zenity --info --title="Uninstall Complete" --text="All NVIDIA components have been purged.\nA reboot is now required to load the default video driver."
+    if user_confirm "Reboot now?" "Reboot Required"; then
+        reboot
+    fi
 }
 
-# -- Verify installation -----------------------------------------------------
-verify_install() {
-  log "Verifying installation"
-  run_or_log "lspci | grep -i -E 'vga|3d|display' || true"
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    run_or_log "nvidia-smi || true"
-  else
-    log "nvidia-smi not found; driver may not be installed."
-    zenity --warning --title="Verify" --text="nvidia-smi not found. Driver may not be installed or loaded. Check log: $LOG_FILE"
-  fi
+show_about_dialog() {
+    zenity --info --title="About This Installer" --width=700 --text="<b>Kali NVIDIA Installer - Leviathan Edition</b>\n\nThis script provides an extremely robust, safe, and guided process for installing NVIDIA's proprietary drivers on Kali Linux, following official best practices.\n\n<b>Key Features:</b>\n- <b>Exhaustive Pre-Flight Analysis:</b> Checks everything from disk space and Secure Boot to virtualization before starting.\n- <b>Philosopher's Guide:</b> Explains every step of the installation process with detailed dialogs.\n- <b>Deep Dive Verification:</b> A multi-point check to ensure the driver is not just installed, but fully functional.\n- <b>Error Resilience:</b> Fails gracefully with clear error messages if any step goes wrong.\n- <b>Comprehensive Logging:</b> Every action is recorded in <b>$LOG_FILE</b>."
 }
 
-# -- Module signing helper (explain steps) -----------------------------------
-show_signing_info() {
-  zenity --info --title="Secure Boot / Module signing" --text="If Secure Boot is enabled, unsigned kernel modules (like those built by DKMS) will not load.\n\nOptions:\n 1) Disable Secure Boot in firmware/UEFI (easiest)\n 2) Sign modules with a Machine Owner Key (MOK) and enroll it (more secure)\n\nSee Debian Secure Boot docs for details and mokutil usage."
-  log "Displayed Secure Boot info to user."
-}
+# --- Main Menu and Script Entrypoint -----------------------------------------
 
-# -- Menu / UI ---------------------------------------------------------------
 main_menu() {
-  ensure_zenity
-  local choice
-  choice=$(zenity --list --title="Kali NVIDIA Installer" --text="Choose an action" --height=400 --width=700 \
-    --column="Action" \
-    "Detect GPU" \
-    "Enable contrib & non-free" \
-    "Install prerequisites (headers, dkms, build-essential)" \
-    "Blacklist nouveau & update initramfs" \
-    "Install NVIDIA (repo, recommended)" \
-    "Install NVIDIA (.run, advanced)" \
-    "Install CUDA (repos)" \
-    "Verify driver / nvidia-smi" \
-    "Uninstall NVIDIA (purge)" \
-    "Show Secure Boot info" \
-    "View log file" \
-    "Toggle Dry-run" \
-    "Exit")
-  case "$choice" in
-    "Detect GPU") detect_gpu ;;
-    "Enable contrib & non-free") enable_nonfree ;;
-    "Install prerequisites (headers, dkms, build-essential)") install_prereqs ;;
-    "Blacklist nouveau & update initramfs") blacklist_nouveau_and_update_initramfs ;;
-    "Install NVIDIA (repo, recommended)") install_nvidia_from_repo ;;
-    "Install NVIDIA (.run, advanced)") install_nvidia_from_run ;;
-    "Install CUDA (repos)") run_or_log "DEBIAN_FRONTEND=noninteractive apt install -y nvidia-cuda-toolkit || true" ;;
-    "Verify driver / nvidia-smi") verify_install ;;
-    "Uninstall NVIDIA (purge)") uninstall_nvidia ;;
-    "Show Secure Boot info") show_signing_info ;;
-    "View log file") xdg-open "$LOG_FILE" || zenity --text-info --filename="$LOG_FILE" --title="Log file" --width=800 --height=600 ;;
-    "Toggle Dry-run")
-      DRY_RUN=!$DRY_RUN
-      if [ "$DRY_RUN" = true ]; then
-        zenity --info --text="Now running in DRY-RUN mode. No changes will be made."
-      else
-        zenity --info --text="DRY-RUN disabled. Actions will be applied."
-      fi
-      ;;
-    "Exit") log "User exit"; exit 0 ;;
-    *) log "No selection or dialog closed"; exit 0 ;;
-  esac
+    echo "$BANNER" # Also print banner to terminal
+    local choice
+    choice=$(zenity --list --title="Kali NVIDIA Installer - Leviathan Edition" --text="$BANNER\nWelcome. Please select an action." --height=500 --width=800 \
+        --column="Action" --column="Description" \
+        "Start Leviathan Installation" "The fully automated, guided process to install, update, and configure the drivers." \
+        "Deep Dive Verification Suite" "Run a comprehensive check to see if your drivers are installed and working correctly." \
+        "Purge All NVIDIA Drivers" "Completely uninstall all NVIDIA components and return to the default driver." \
+        "View Log File" "Open the detailed log file for the current session for troubleshooting." \
+        "About This Installer" "Information about the features and purpose of this script." \
+        "Exit" "Close the application.")
+
+    case "$choice" in
+        "Start Leviathan Installation") leviathan_install ;;
+        "Deep Dive Verification Suite") comprehensive_verification ;;
+        "Purge All NVIDIA Drivers") uninstall_nvidia ;;
+        "View Log File")
+            xdg-open "$LOG_FILE" 2>/dev/null || zenity --text-info --filename="$LOG_FILE" --title="Log File" --width=900 --height=700
+            ;;
+        "About This Installer") show_about_dialog ;;
+        *)
+            log "User selected exit or closed the dialog. Shutting down."
+            exit 0
+            ;;
+    esac
 }
 
-# -- Ensure log directory exists / permission ---------------------------------
-if [ "$(id -u)" -ne 0 ]; then
-  # Not root yet — show an info dialog then restart as root
-  if [ -n "$ZENITY" ]; then
-    zenity --info --title="Kali NVIDIA Installer" --text="This script will ask for root privileges via sudo when needed."
-  fi
-fi
+# --- Script Entrypoint ---
+# Initialize log file
+mkdir -p "$LOG_DIR"
+touch "$LOG_FILE"
+log "--- Kali NVIDIA Leviathan Installer session started ---"
 
-mkdir -p "$LOG_DIR" || true
-touch "$LOG_FILE" || true
-log "Starting $PROGNAME (log: $LOG_FILE)"
-ensure_zenity
-ensure_root
+# Ensure core dependencies are met before showing the main menu for the first time
+_check_root
+_check_zenity
 
-# Main loop
+# Main application loop
 while true; do
-  main_menu
+    main_menu
 done
-
-# EOF
