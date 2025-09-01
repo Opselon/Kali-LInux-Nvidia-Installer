@@ -1,4 +1,4 @@
-I understand. You've provided feedback that the previous script's logging and error reporting weren't as robust as expected, and you'd like to:Fix Logging and Error Reporting: Ensure logs are consistently shown, and errors trigger clear Zenity dialogs.Enhance Colorization: Make both terminal output and Zenity dialogs more visually informative.Increase Verbosity/Length: Add more descriptive text and explanations to dialogs and messages.Maintain Core Logic: Keep the existing functionality and structure intact while improving these aspects.I will now apply these improvements to the kali-nvidia-installer-leviathan.sh script you provided.Here is the updated script with enhanced logging, colorization, verbosity, and improved error handling: code Bashdownloadcontent_copyexpand_less    #!/usr/bin/env bash
+#!/usr/bin/env bash
 #
 # kali-nvidia-installer-leviathan.sh
 #
@@ -55,7 +55,7 @@ log() {
     local log_prefix_term="${timestamp} | ${COLOR_BOLD}${PROGNAME}:${COLOR_RESET} " # Prefix for terminal, with color
     local terminal_output=""
 
-    # Determine color and format for terminal output
+    # Determine color and format for terminal output based on message type.
     if [[ "$msg" == FATAL* || "$msg" == ERROR* ]]; then
         terminal_output="${COLOR_RED}${log_prefix_term}${COLOR_BOLD}${msg}${COLOR_RESET}"
     elif [[ "$msg" == SUCCESS* ]]; then
@@ -70,9 +70,9 @@ log() {
         terminal_output="${log_prefix_term}${msg}${COLOR_RESET}"
     fi
 
-    # Log to file (always plain text for consistency and easier parsing)
+    # Log to file (always plain text for consistency and easier parsing).
     echo "${log_prefix_file}${msg}" | tee -a "$LOG_FILE"
-    # Print to terminal with color for immediate feedback
+    # Print to terminal with color for immediate feedback.
     echo -e "${terminal_output}"
 }
 
@@ -104,7 +104,8 @@ run_with_progress() {
     log "EXEC (Progress): $*"
     # Capture command output (stdout & stderr), tee it to the log file, and pipe it to Zenity for progress display.
     # PIPESTATUS[0] checks the exit status of the command itself, before the pipe.
-    ( "$@" 2>&1 | tee -a "$LOG_FILE" ) | zenity --progress --title="$title" --text="<b><span color='blue'>Task:</span> $title</b>\n\nRunning: <i>$*</i>\n\n<span color='gray'>(This operation may take some time. For real-time, detailed output, please consult the log file.)</span>" --pulsate --auto-close --auto-kill --width=700
+    # --auto-close is removed to keep the dialog open after completion.
+    ( "$@" 2>&1 | tee -a "$LOG_FILE" ) | zenity --progress --title="$title" --text="<b><span color='blue'>Task:</span> $title</b>\n\nRunning: <i>$*</i>\n\n<span color='gray'>(This operation may take some time. The dialog will remain open until this task is complete. For real-time, detailed output, please consult the log file.)</span>" --pulsate --auto-kill --width=700
     if [ "${PIPESTATUS[0]}" -ne 0 ]; then
         # If the command failed, trigger a critical error exit.
         err_exit "The command '$*' failed during a progress operation. Check the log."
@@ -117,8 +118,8 @@ user_confirm() {
     local question_text="$1"
     local title="$2:- Confirmation"
     # Use Pango markup for better readability in the confirmation dialog.
-    zenity --question --title="$title" --width=500 --height=150 \
-        --text="<span size='large'><b>$title</b></span>\n\n$question_text"
+    zenity --question --title="$title" --width=500 --height=180 \
+        --text="<span size='large'><b>$title</b></span>\n\n$question_text\n\n<span color='gray'><i>(Please review carefully before confirming.)</i></span>"
 }
 
 # --- Pre-Flight System Analysis Suite -----------------------------------------
@@ -127,9 +128,10 @@ user_confirm() {
 _check_root() {
     log "Verifying root privileges..."
     if [ "$EUID" -ne 0 ]; then
-        # If not root, try to re-run with sudo and exit if it fails.
+        # If not root, exit with a clear message. The script requires root.
         err_exit "This script requires root privileges. Please run with sudo or as root."
     fi
+    log "Root privileges confirmed."
 }
 
 # Checks if Zenity is installed and attempts to install it if missing.
@@ -149,10 +151,11 @@ _check_zenity() {
         # Re-verify Zenity path after installation.
         ZENITY=$(command -v zenity)
         if [ -z "$ZENITY" ]; then
-            err_exit "Zenity installation successful, but 'zenity' command not found. Cannot continue without GUI."
+            err_exit "Zenity installation reported success, but the 'zenity' command is still not found. Cannot continue without GUI."
         fi
-        log "Zenity installed successfully. Proceeding."
+        log "Zenity installed successfully. Proceeding with the script."
     fi
+    log "Zenity is available."
 }
 
 # Checks for a stable internet connection.
@@ -161,7 +164,7 @@ _check_internet() {
     # Ping a reliable IP address (like Google's DNS) twice.
     if ! ping -c 2 8.8.8.8 >/dev/null 2>&1; then
         # If ping fails, exit with an informative error.
-        err_exit "No internet connection detected. This installer requires an active internet connection to download packages and updates."
+        err_exit "No internet connection detected. This installer requires an active internet connection to download packages and updates. Please check your network configuration."
     fi
     log "Internet connection confirmed."
 }
@@ -172,7 +175,7 @@ _check_apt_lock() {
     # Check for dpkg and apt list locks.
     if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
         # If locks are found, inform the user and exit.
-        err_exit "APT is locked by another process. Please close any other package managers (e.g., Synaptic, another terminal running 'apt') and try again."
+        err_exit "APT is locked by another process. Please close any other package managers (e.g., Synaptic, another terminal running 'apt', or unattended-upgrades) and try again."
     fi
     log "APT is not locked."
 }
@@ -184,11 +187,11 @@ _check_gpu_presence() {
     if ! lspci | grep -q -i 'vga.*nvidia'; then
         log "Warning: No NVIDIA GPU was automatically detected via 'lspci'."
         # If no GPU is found, ask the user for confirmation before proceeding.
-        if ! user_confirm "No NVIDIA GPU was automatically detected.\n\nThis is highly unusual and proceeding might be unproductive.\n\nDo you wish to continue anyway at your own risk?" "Hardware Check Warning"; then
+        if ! user_confirm "No NVIDIA GPU was automatically detected using 'lspci'.\n\nThis is highly unusual for an NVIDIA driver installation and proceeding might be unproductive.\n\nDo you wish to continue anyway at your own risk?" "Hardware Check Warning"; then
             err_exit "Installation canceled by user. No NVIDIA GPU detected."
         fi
     else
-        log "NVIDIA GPU detected."
+        log "NVIDIA GPU detected successfully."
     fi
 }
 
@@ -199,14 +202,14 @@ _check_secure_boot() {
     if mokutil --sb-state 2>/dev/null | grep -q enabled; then
         log "Warning: Secure Boot is enabled."
         # Display a detailed warning to the user explaining the implications.
-        zenity --warning --title="Security Alert: Secure Boot Enabled" --width=600 --height=250 \
-            --text="<span size='large' color='red'><b>Secure Boot is ACTIVE!</b></span>\n\nThe NVIDIA driver modules that this script compiles (using DKMS) are <b>not cryptographically signed</b> by default. Because of this, the kernel will <b>block</b> them from loading when Secure Boot is enabled.\n\n<b>Recommended Action:</b>\n1. Exit this installer now.\n2. Reboot your computer and enter your UEFI/BIOS settings.\n3. Disable the 'Secure Boot' option.\n4. Reboot back into Kali and run this installer again.\n\n<span color='orange'>Alternatively, you may proceed if you are an advanced user planning to manually sign the modules (MOK).</span>"
+        zenity --warning --title="Security Alert: Secure Boot Enabled" --width=600 --height=280 \
+            --text="<span size='large' color='red'><b>Security Alert: Secure Boot is ACTIVE!</b></span>\n\nThe NVIDIA driver modules that this script compiles (using DKMS) are <b>not cryptographically signed</b> by default. Because of this, the kernel will <b>block</b> them from loading when Secure Boot is enabled, preventing the NVIDIA driver from functioning.\n\n<b>Recommended Action:</b>\n1. Exit this installer now.\n2. Reboot your computer and enter your UEFI/BIOS settings.\n3. Disable the 'Secure Boot' option.\n4. Reboot back into Kali and re-run this installer.\n\n<span color='orange'><b>Alternative for Advanced Users:</b></span> You may proceed if you are an advanced user planning to manually sign the NVIDIA kernel modules with your own Machine Owner Key (MOK) after they are built."
         # Ask for user confirmation to proceed despite the warning.
-        if ! user_confirm "Do you understand the risks and wish to continue with Secure Boot enabled?" "Secure Boot Confirmation"; then
+        if ! user_confirm "Do you understand the risks associated with Secure Boot and wish to continue anyway?" "Secure Boot Confirmation"; then
             err_exit "Installation canceled by user due to Secure Boot being enabled."
         fi
     else
-        log "Secure Boot is disabled or not supported. Proceeding."
+        log "Secure Boot is disabled or not supported. Proceeding without Secure Boot warning."
     fi
 }
 
@@ -219,14 +222,14 @@ _check_virtual_machine() {
     if [ "$vm" != "none" ]; then
         log "Warning: Virtual machine environment '$vm' detected."
         # Inform the user about potential issues with VMs and GPU passthrough.
-        zenity --warning --title="Virtual Machine Detected" --width=550 --height=200 \
-            --text="<span size='large' color='orange'><b>Virtual Machine Detected</b></span>\n\nThis script has detected that it is running inside a virtual machine environment (<b>$vm</b>).\n\nInstalling NVIDIA drivers within a VM typically requires specific GPU Passthrough (IOMMU) configuration on the host system, which is beyond the scope of this script.\n\nStandard driver installation within a VM will likely fail or have no effect.\n\nDo you wish to proceed at your own risk?" "Virtualization Warning"
+        zenity --warning --title="Virtual Machine Detected" --width=550 --height=250 \
+            --text="<span size='large' color='orange'><b>Virtual Machine Detected</b></span>\n\nThis script has detected that it is running inside a virtual machine environment (<b>$vm</b>).\n\nInstalling NVIDIA drivers within a VM is a complex topic that typically requires specific GPU Passthrough (IOMMU) configuration on the host system, which is beyond the scope of this installer.\n\nStandard driver installation within a VM will likely fail or have no effect on your virtual graphics performance.\n\nDo you wish to proceed with the installation at your own risk?" "Virtualization Warning"
         # If the user cancels, exit.
         if [ $? -ne 0 ]; then
             err_exit "Installation canceled by user due to detected VM environment."
         fi
     else
-        log "Not running in a virtual machine."
+        log "Not running in a virtual machine environment."
     fi
 }
 
@@ -240,9 +243,9 @@ _check_disk_space() {
 
     # Check against the minimum requirement for base installation.
     if [ "$free_space_gb" -lt "$MIN_DISK_SPACE_GB" ]; then
-        err_exit "Insufficient disk space. You have only ${free_space_gb}GB free, but at least ${MIN_DISK_SPACE_GB}GB is required for the NVIDIA driver installation."
+        err_exit "Insufficient disk space. You have only ${free_space_gb}GB free, but at least ${MIN_DISK_SPACE_GB}GB is required for the NVIDIA driver installation and its dependencies."
     fi
-    log "Disk space check passed: ${free_space_gb}GB available."
+    log "Disk space check passed: ${free_space_gb}GB available on root partition."
 }
 
 # Verifies that the system is configured to use the 'kali-rolling' repository.
@@ -251,24 +254,24 @@ _check_kali_repo() {
     # Check sources.list and sources.list.d for lines matching the kali-rolling repository.
     if ! grep -q "^deb .*$REQUIRED_REPO" /etc/apt/sources.list /etc/apt/sources.list.d/*; then
         # If not found, exit with an error.
-        err_exit "The required '$REQUIRED_REPO' repository is not configured in your APT sources.\nThis script is designed specifically for Kali Rolling. Please ensure your system is set up correctly."
+        err_exit "The required '$REQUIRED_REPO' repository is not configured in your APT sources.\nThis script is designed specifically for Kali Rolling. Please ensure your system is correctly set up with the 'kali-rolling' repository enabled."
     fi
     log "'kali-rolling' repository confirmed."
 }
 
 # Master function to run all pre-flight checks sequentially with progress feedback.
 run_all_pre_flight_checks() {
-    log "--- Starting Pre-Flight System Analysis Suite ---"
+    log "--- Starting Comprehensive Pre-Flight System Analysis Suite ---"
     # Use a Zenity progress bar to show the progress of all checks.
     (
         echo "0"; echo "# Initializing Analysis..."
         # Execute each check function. If any fails, err_exit will terminate the script.
         _check_root
-        echo "5"; echo "# Verifying Zenity..."
+        echo "5"; echo "# Verifying Zenity GUI..."
         _check_zenity
         echo "15"; echo "# Checking Internet Connection..."
         _check_internet
-        echo "25"; echo "# Checking APT Locks..."
+        echo "25"; echo "# Checking APT Package Manager Locks..."
         _check_apt_lock
         echo "35"; echo "# Scanning for NVIDIA Hardware..."
         _check_gpu_presence
@@ -276,13 +279,13 @@ run_all_pre_flight_checks() {
         _check_secure_boot
         echo "65"; echo "# Detecting Virtualization Environment..."
         _check_virtual_machine
-        echo "80"; echo "# Analyzing Disk Space..."
+        echo "80"; echo "# Analyzing Available Disk Space..."
         _check_disk_space
         echo "90"; echo "# Verifying Kali Repository Configuration..."
         _check_kali_repo
-        echo "100"; echo "# All pre-flight checks passed successfully."
+        echo "100"; echo "# All pre-flight checks completed successfully. System appears ready."
         sleep 1 # Short pause before closing progress dialog
-    ) | zenity --progress --title="System Pre-flight Analysis" --width=600 --auto-close --auto-kill
+    ) | zenity --progress --title="System Pre-flight Analysis" --width=650 --height=150 --auto-close --auto-kill
     log "--- System Analysis Complete. All systems nominal. ---"
 }
 
@@ -291,8 +294,8 @@ run_all_pre_flight_checks() {
 # Step 1: Perform a full system upgrade.
 step_1_system_upgrade() {
     # Provide a detailed explanation of the importance of this step.
-    zenity --info --title="Installation - Step 1/5: System Synchronization" --width=650 --height=250 \
-        --text="<span size='large'><b>Step 1: Full System Synchronization</b></span>\n\nAs per the official Kali Linux documentation, the most critical first step is to ensure your entire system is up-to-date.\n\nThis synchronizes your installed Linux kernel with the available kernel headers and ensures all packages are at their latest versions, which is vital for a stable driver build.\n\n<b>Actions Performed:</b>\n1. <b>apt update</b>: Refreshes the package lists from repositories.\n2. <b>apt full-upgrade</b>: Upgrades all installed packages to their latest versions, intelligently handling dependencies and kernel updates.\n\n<span color='orange'><b>Note:</b> This process can take a significant amount of time depending on your system's current state and internet speed. Please be patient.</b></span>"
+    zenity --info --title="Installation - Step 1/5: System Synchronization" --width=650 --height=300 \
+        --text="<span size='large'><b>Step 1: Full System Synchronization</b></span>\n\nAs per the official Kali Linux documentation, the most critical first step is to ensure your entire system is up-to-date. This synchronizes your installed Linux kernel with the available kernel headers and ensures all packages are at their latest versions.\n\nThis step is vital for a stable driver build and prevents compatibility issues.\n\n<b>Actions Performed:</b>\n1. <b>apt update</b>: Fetches the latest package information from all enabled repositories.\n2. <b>apt full-upgrade</b>: Upgrades all installed packages to their latest versions, intelligently handling dependencies and potentially installing new kernels or removing obsolete packages.\n\n<span color='orange'><b>Important Note:</b> This process can take a significant amount of time, depending on your system's current state and internet speed. Please be patient and do not interrupt it.</span>"
     # Execute the upgrade commands with progress indication.
     run_with_progress "Updating package lists (apt update)..." apt-get update -y
     run_with_progress "Performing full system upgrade (apt full-upgrade)..." apt-get full-upgrade -y
@@ -304,8 +307,8 @@ step_2_reboot_check() {
     if [ -f /var/run/reboot-required ]; then
         log "Reboot required after system upgrade."
         # Inform the user that a reboot is mandatory.
-        zenity --info --title="Installation - Action Required: Reboot" --width=550 --height=200 \
-            --text="<span size='large'><b>Reboot is Mandatory!</b></span>\n\nThe system upgrade has installed a new Linux kernel or critical system components.\n\nA <b>reboot is now absolutely necessary</b> to load this new kernel and ensure compatibility with the NVIDIA driver installation.\n\nThe installer will now prompt you to reboot. Proceeding without a reboot will likely lead to driver installation failure."
+        zenity --info --title="Installation - Action Required: Reboot" --width=550 --height=220 \
+            --text="<span size='large'><b>Reboot is Mandatory!</b></span>\n\nThe system upgrade you just completed has installed a new Linux kernel or critical system components.\n\nA <b>reboot is now absolutely necessary</b> to load this new kernel and ensure compatibility with the NVIDIA driver installation that follows.\n\nThe installer will now prompt you to reboot.\n\n<span color='red'>Proceeding without a reboot will almost certainly lead to driver installation failure or a non-functional system.</span>"
         # Ask for user confirmation to reboot.
         if user_confirm "Click 'Yes' to reboot the system now.\nClick 'No' to cancel the entire installation process." "Mandatory Reboot"; then
             log "User confirmed reboot to load new kernel."
@@ -317,27 +320,27 @@ step_2_reboot_check() {
             err_exit "Reboot was declined. Cannot safely continue the NVIDIA driver installation without a system reboot."
         fi
     else
-        log "No reboot required after system upgrade."
+        log "No reboot required after system upgrade. Proceeding to the next step."
     fi
 }
 
 # Step 3: Install necessary kernel headers and DKMS.
 step_3_install_headers() {
     # Explain the role of kernel headers and DKMS.
-    zenity --info --title="Installation - Step 2/5: Kernel Headers & DKMS" --width=650 --height=250 \
-        --text="<span size='large'><b>Step 2: Installing Kernel Headers and DKMS</b></span>\n\nThe NVIDIA driver is a kernel module. To function correctly, it must be compiled specifically for your running Linux kernel version.\n\nThis step installs:\n- <b>linux-headers-$(uname -r):</b> Provides the necessary header files for your current kernel.\n- <b>dkms (Dynamic Kernel Module Support):</b> A framework that automatically rebuilds kernel modules (like NVIDIA's) when the kernel is updated.\n\nThese are essential for the driver to load correctly and to survive future kernel updates."
+    zenity --info --title="Installation - Step 2/5: Kernel Headers & DKMS" --width=650 --height=280 \
+        --text="<span size='large'><b>Step 2: Installing Kernel Headers and DKMS</b></span>\n\nThe NVIDIA driver is a kernel module, not a standard application. For it to function correctly, it must be compiled specifically for your running Linux kernel version.\n\nThis step installs the essential components for this compilation:\n- <b>linux-headers-$(uname -r):</b> Provides the necessary source code and build tools for your exact kernel version.\n- <b>dkms (Dynamic Kernel Module Support):</b> A crucial framework that automatically recompiles kernel modules (like NVIDIA's) whenever the Linux kernel itself is updated. This ensures your driver stays compatible after kernel upgrades.\n\nThese packages are foundational for a stable, self-maintaining NVIDIA driver installation."
     local kernel_version
     kernel_version=$(uname -r)
     log "Target kernel version identified as: $kernel_version."
     # Install the packages using run_with_progress.
-    run_with_progress "Installing Linux Headers and DKMS..." apt-get install -y "linux-headers-$kernel_version" dkms
+    run_with_progress "Installing Linux Headers (linux-headers-$(uname -r)) and DKMS..." apt-get install -y "linux-headers-$kernel_version" dkms
 }
 
 # Step 4: Install the NVIDIA driver packages from the repository.
 step_4_install_drivers() {
     # Explain the core driver installation process.
-    zenity --info --title="Installation - Step 3/5: NVIDIA Driver Installation" --width=650 --height=250 \
-        --text="<span size='large'><b>Step 3: Installing the NVIDIA Driver Packages</b></span>\n\nNow, we install the main proprietary NVIDIA driver components from the Kali repository.\n\n<b>Packages Installed:</b>\n- <b>nvidia-driver:</b> The core proprietary NVIDIA graphics driver.\n- <b>nvidia-kernel-dkms:</b> This package uses DKMS to automatically compile the NVIDIA kernel module for your current kernel.\n\n<b>Automatic Configuration:</b>\nDuring this process, the installer will also automatically create a configuration file to <b>blacklist</b> the open-source 'nouveau' driver, preventing conflicts with the NVIDIA driver."
+    zenity --info --title="Installation - Step 3/5: NVIDIA Driver Installation" --width=650 --height=300 \
+        --text="<span size='large'><b>Step 3: Installing the NVIDIA Driver Packages</b></span>\n\nNow, we install the main proprietary NVIDIA driver components directly from the Kali Linux repositories.\n\n<b>Packages Installed:</b>\n- <b>nvidia-driver:</b> This is the core proprietary NVIDIA graphics driver package.\n- <b>nvidia-kernel-dkms:</b> This package is intelligent; when installed, it triggers DKMS to automatically compile the NVIDIA kernel module specifically for your current kernel version.\n\n<b>Automatic Configuration:</b>\nDuring this installation, the system will also automatically create a configuration file to <b>blacklist</b> the default open-source 'nouveau' driver. This is crucial to prevent conflicts between the two drivers.\n\n<span color='blue'>The installer will now download and install these essential components.</span>"
     # Execute the driver installation commands.
     run_with_progress "Installing nvidia-driver and nvidia-kernel-dkms..." apt-get install -y nvidia-driver nvidia-kernel-dkms
 }
@@ -345,17 +348,17 @@ step_4_install_drivers() {
 # Step 5: Optionally install the NVIDIA CUDA Toolkit.
 step_5_install_cuda_optional() {
     # Explain the purpose and size of CUDA.
-    zenity --info --title="Installation - Step 4/5: Optional CUDA Toolkit" --width=650 --height=250 \
-        --text="<span size='large'><b>Step 4 (Optional): Install NVIDIA CUDA Toolkit</b></span>\n\nThe NVIDIA CUDA Toolkit enables GPU-accelerated computing. This is crucial for tasks such as:\n- Password cracking (e.g., Hashcat)\n- Machine Learning and Deep Learning\n- Scientific simulations and data processing.\n\n<span color='orange'><b>Warning:</b> The CUDA Toolkit is a <b>very large</b> download, often several gigabytes. Only install this if you specifically require GPU computing capabilities.</b></span>"
+    zenity --info --title="Installation - Step 4/5: Optional CUDA Toolkit" --width=650 --height=300 \
+        --text="<span size='large'><b>Step 4 (Optional): Install NVIDIA CUDA Toolkit</b></span>\n\nThe NVIDIA CUDA Toolkit is a parallel computing platform and programming model developed by NVIDIA. It enables the GPU to be used for general-purpose processing, significantly accelerating tasks that can be parallelized.\n\nThis is essential for applications such as:\n- Password cracking (e.g., Hashcat, John the Ripper with GPU acceleration)\n- Machine Learning and Deep Learning frameworks (TensorFlow, PyTorch)\n- Scientific simulations, data analysis, and video rendering.\n\n<span color='orange'><b>Important Warning:</b> The CUDA Toolkit is a <b>very large</b> download, often several gigabytes in size. Only install this if you specifically require GPU computing capabilities. Installing it unnecessarily will consume significant disk space and download time.</span>"
     # Ask the user if they want to install CUDA.
-    if user_confirm "Do you want to install the NVIDIA CUDA Toolkit (nvidia-cuda-toolkit)?" "Optional CUDA Installation"; then
-        log "User chose to install CUDA."
+    if user_confirm "Do you specifically need to use your GPU for parallel computing tasks (like machine learning or password cracking)?\n\nIf yes, select 'Yes' to install the NVIDIA CUDA Toolkit." "Optional CUDA Installation"; then
+        log "User chose to install CUDA Toolkit."
         # Perform a disk space check specifically for CUDA if the user agrees.
         _check_disk_space_for_cuda
         # Install the CUDA package.
-        run_with_progress "Installing CUDA Toolkit (nvidia-cuda-toolkit)..." apt-get install -y nvidia-cuda-toolkit
+        run_with_progress "Installing CUDA Toolkit (nvidia-cuda-toolkit)... This may take a very long time." apt-get install -y nvidia-cuda-toolkit
     else
-        log "User skipped CUDA installation."
+        log "User skipped CUDA installation. Proceeding without CUDA."
     fi
 }
 
@@ -367,19 +370,19 @@ _check_disk_space_for_cuda() {
     local free_space_gb=$((free_space_kb / 1024 / 1024))
     # Check against the higher requirement for CUDA.
     if [ "$free_space_gb" -lt "$MIN_DISK_SPACE_CUDA_GB" ]; then
-        err_exit "Insufficient disk space for CUDA. You have ${free_space_gb}GB free, but at least ${MIN_DISK_SPACE_CUDA_GB}GB is recommended for the CUDA toolkit."
+        err_exit "Insufficient disk space for CUDA. You have ${free_space_gb}GB free, but at least ${MIN_DISK_SPACE_CUDA_GB}GB is recommended for the CUDA toolkit and its associated libraries."
     fi
-    log "Disk space check passed for CUDA: ${free_space_gb}GB available."
+    log "Disk space check passed for CUDA: ${free_space_gb}GB available on root partition."
 }
 
 # Step 6: Prompt the user for a final reboot to activate the driver.
 step_6_final_reboot_prompt() {
-    log "NVIDIA driver installation process has completed."
+    log "NVIDIA driver installation process has completed all installation steps."
     # Inform the user that a reboot is needed for activation.
-    zenity --info --title="Installation - Step 5/5: Final Reboot Required" --width=550 --height=200 \
-        --text="<span size='large'><b>Installation Complete!</b></span>\n\nThe NVIDIA driver and all necessary components have been successfully installed and compiled.\n\nA final reboot is required to unload the old 'nouveau' driver and load the new 'nvidia' driver into the kernel.\n\nAfter rebooting, you can run the 'Deep Dive Verification Suite' from the main menu to confirm everything is working correctly.\n\n<span color='blue'>Thank you for using the Leviathan Installer!</span>"
+    zenity --info --title="Installation - Step 5/5: Final Reboot Required" --width=550 --height=250 \
+        --text="<span size='large'><b>Installation Complete!</b></span>\n\nThe NVIDIA driver and all necessary components have been successfully installed and compiled for your system.\n\nA final reboot is required to unload the old 'nouveau' driver and load the new 'nvidia' driver into the kernel.\n\nAfter rebooting, you can re-run this installer and select the 'Deep Dive Verification Suite' option from the main menu to confirm everything is working correctly.\n\n<span color='blue'>Thank you for using the Kali NVIDIA Leviathan Installer! Your system is now ready for enhanced graphics performance.</span>"
     # Ask if the user wants to reboot now.
-    if user_confirm "Click 'Yes' to reboot the system now.\nClick 'No' to reboot later manually." "Final Reboot Prompt"; then
+    if user_confirm "A system reboot is required to activate the new NVIDIA driver.\n\nClick 'Yes' to reboot the system now.\nClick 'No' to perform the reboot manually later." "Final Reboot Prompt"; then
         log "User confirmed final reboot."
         # Initiate reboot.
         reboot
@@ -392,15 +395,15 @@ step_6_final_reboot_prompt() {
 leviathan_install() {
     log "--- Initiating Leviathan Installation Process ---"
     # Initial confirmation before starting the entire process.
-    if ! user_confirm "You are about to begin the fully automated NVIDIA driver installation process.\n\nThis will upgrade your entire system, install new drivers, and potentially reboot.\n\nIt is highly recommended to close all other applications and save your work before proceeding.\n\nDo you wish to proceed with the Leviathan Installation?" "Confirm Full Installation"; then
+    if ! user_confirm "You are about to begin the fully automated NVIDIA driver installation process.\n\nThis process will perform a full system upgrade, install NVIDIA drivers, and may require one or more reboots.\n\nIt is highly recommended to close all other applications and save your work before proceeding.\n\nDo you wish to proceed with the Leviathan Installation?" "Confirm Full Installation"; then
         log "User aborted the Leviathan installation process at the initial confirmation."
         return # Exit the function if user cancels.
     fi
 
-    # Run all pre-flight checks first.
+    # Run all pre-flight checks first. This ensures the system is ready.
     run_all_pre_flight_checks
 
-    # Execute the installation steps sequentially.
+    # Execute the installation steps sequentially, guiding the user through each phase.
     step_1_system_upgrade
     step_2_reboot_check
     step_3_install_headers
@@ -425,7 +428,7 @@ comprehensive_verification() {
         report+="✅ <b>DKMS Module Status:</b> OK\n   - The 'nvidia' module is successfully registered and built via DKMS.\n\n"
     else
         # If not found or failed to build, append a failure message and set overall_ok to false.
-        report+="❌ <b>DKMS Module Status:</b> FAILED\n   - The 'nvidia' module was NOT found or failed to build in DKMS. This is a critical issue.\n   - If you recently rebooted, DKMS might still be building. Check the log.\n\n"
+        report+="❌ <b>DKMS Module Status:</b> FAILED\n   - The 'nvidia' module was NOT found or failed to build in DKMS. This is a critical issue.\n   - If you recently rebooted, DKMS might still be building. Check the log for details.\n\n"
         all_ok=false
     fi
 
@@ -496,7 +499,7 @@ comprehensive_verification() {
 # Uninstalls all NVIDIA-related packages and attempts to restore the Nouveau driver.
 uninstall_nvidia() {
     # Ask for strong confirmation before proceeding with uninstallation.
-    if ! user_confirm "This action will completely <b>PURGE</b> all NVIDIA packages from your system.\nIt will also attempt to restore the default 'nouveau' open-source driver.\n\nA reboot will be required afterward.\n\nAre you absolutely certain you want to proceed with the uninstallation?" "Confirm NVIDIA Driver Uninstallation"; then
+    if ! user_confirm "This action will completely <b>PURGE</b> all NVIDIA packages from your system.\nIt will also attempt to restore the default 'nouveau' open-source driver.\n\nA reboot will be required afterward to load the correct driver.\n\nAre you absolutely certain you want to proceed with the uninstallation?" "Confirm NVIDIA Driver Uninstallation"; then
         log "User canceled the NVIDIA driver uninstallation process."
         return # Exit if user cancels.
     fi
@@ -515,15 +518,15 @@ uninstall_nvidia() {
     zenity --info --title="Uninstallation Complete" --width=500 \
         --text="<span size='large'><b>NVIDIA Driver Uninstallation Successful</b></span>\n\nAll NVIDIA components have been purged from your system.\n\nA reboot is now required to load the default 'nouveau' video driver.\n\nThank you!"
     # Ask for reboot confirmation.
-    if user_confirm "A reboot is required. Reboot now?" "Reboot Required After Uninstall"; then
+    if user_confirm "A reboot is required to activate the restored default driver.\n\nReboot now?" "Reboot Required After Uninstall"; then
         reboot
     fi
 }
 
 # Displays an informative "About" dialog for the script.
 show_about_dialog() {
-    zenity --info --title="About This Installer - Leviathan Edition" --width=700 --height=350 \
-        --text="<span size='large'><b>Kali NVIDIA Installer - Leviathan Edition</b></span>\n\nThis script is an exceptionally robust, safe, and user-centric tool for installing NVIDIA's proprietary drivers on Kali Linux.\n\nIt meticulously follows the official Kali Linux documentation and provides a guided, transparent installation experience.\n\n<b>Key Features:</b>\n- 🚀 <b>Fully Automated 'Leviathan Install'</b>: Handles all steps from system upgrade to driver verification.\n- 🛡️ <b>Exhaustive Pre-Flight Analysis</b>: Detects Secure Boot, VM environments, disk space, and hardware issues before proceeding.\n- 📖 <b>'Philosopher's Guide' UI</b>: Detailed explanations for every action, ensuring you understand what's happening.\n- 🔎 <b>Deep Dive Verification Suite</b>: Confirms driver functionality at multiple levels (DKMS, kernel module, nvidia-smi, OpenGL).\n- ✨ <b>Clean Uninstaller</b>: Safely removes all NVIDIA components and restores the default driver.\n- 🌈 <b>Enhanced Terminal & GUI Feedback</b>: Uses color and detailed messages for a superior user experience.\n- 📝 <b>Comprehensive Logging</b>: All actions are meticulously recorded in <b>$LOG_FILE</b> for troubleshooting.\n\nThis project is a significant enhancement inspired by the original work in the Opselon/Kali-LInux-Nvidia-Installer repository."
+    zenity --info --title="About This Installer - Leviathan Edition" --width=750 --height=400 \
+        --text="<span size='large'><b>Kali NVIDIA Installer - Leviathan Edition</b></span>\n\nThis script is an exceptionally robust, safe, and user-centric tool designed for installing NVIDIA's proprietary drivers on Kali Linux.\n\nIt meticulously follows the official Kali Linux documentation and provides a guided, transparent installation experience, automating the entire process from pre-flight checks to deep-dive verification.\n\n<b>Key Features:</b>\n- 🚀 <b>Fully Automated 'Leviathan Install'</b>: Handles all steps from system upgrade to driver verification, making the complex process simple.\n- 🛡️ <b>Exhaustive Pre-Flight Analysis</b>: Detects potential issues like Secure Boot, VM environments, insufficient disk space, and hardware presence before any changes are made.\n- 📖 <b>'Philosopher's Guide' UI</b>: Detailed explanations for every action taken by the script, ensuring you understand the 'what' and 'why' of each step.\n- 🔎 <b>Deep Dive Verification Suite</b>: Confirms driver functionality at multiple levels, including DKMS status, kernel module loading, `nvidia-smi` communication, and OpenGL rendering.\n- ✨ <b>Clean Uninstaller</b>: Safely removes all NVIDIA components and reliably restores the default 'nouveau' driver.\n- 🌈 <b>Enhanced Terminal & GUI Feedback</b>: Leverages color-coded messages and informative Zenity dialogs for a superior user experience.\n- 📝 <b>Comprehensive & Detailed Logging</b>: All operations, commands, and their outputs are meticulously recorded in <b>$LOG_FILE</b> for easy troubleshooting and auditing.\n\nThis project is a significant enhancement and evolution inspired by the foundational work in the Opselon/Kali-LInux-Nvidia-Installer repository."
 }
 
 # --- Main Menu and Script Entrypoint ---
@@ -531,17 +534,17 @@ show_about_dialog() {
 # Displays the main menu for user interaction.
 main_menu() {
     # Print the ASCII banner to the terminal for visual appeal.
-    echo "$BANNER"
+    echo -e "$BANNER"
     local choice
     # Present the main options to the user via a Zenity list dialog.
-    choice=$(zenity --list --title="Kali NVIDIA Installer - Leviathan Edition" --text="$BANNER\n<span size='large'>Welcome. Please select an action from the list below.</span>" --height=500 --width=800 \
+    choice=$(zenity --list --title="Kali NVIDIA Installer - Leviathan Edition" --text="$BANNER\n<span size='large'>Welcome to the Kali NVIDIA Installer - Leviathan Edition.</span>\n\nPlease select an action from the list below to manage your NVIDIA drivers." --height=500 --width=850 \
         --column="Action" --column="Description" \
-        "Start Leviathan Installation" "The fully automated, guided process to install, update, and configure NVIDIA drivers." \
-        "Deep Dive Verification Suite" "Run a comprehensive diagnostic to check if drivers are installed and working correctly." \
-        "Purge All NVIDIA Drivers" "Completely uninstall all NVIDIA components and restore the default 'nouveau' driver." \
-        "View Log File" "Open the detailed log file for the current session for troubleshooting." \
-        "About This Installer" "Information about the script's features and purpose." \
-        "Exit" "Close the application.")
+        "Start Leviathan Installation" "The ultimate, fully automated, and guided process to install, update, and configure your NVIDIA drivers." \
+        "Deep Dive Verification Suite" "Run a comprehensive diagnostic suite to confirm if your NVIDIA drivers are installed correctly and are fully functional." \
+        "Purge All NVIDIA Drivers" "Completely uninstall all NVIDIA components, revert system changes, and restore the default 'nouveau' driver." \
+        "View Log File" "Open the detailed log file for the current session for troubleshooting and auditing purposes." \
+        "About This Installer" "Display information about the script's advanced features, purpose, and development." \
+        "Exit" "Close the application and exit the installer.")
 
     # Process the user's selection.
     case "$choice" in
@@ -549,15 +552,15 @@ main_menu() {
         "Deep Dive Verification Suite") comprehensive_verification ;;
         "Purge All NVIDIA Drivers") uninstall_nvidia ;;
         "View Log File")
-            # Attempt to open the log file with the default application or show it in Zenity.
+            # Attempt to open the log file with the default application or show it in Zenity if xdg-open fails.
             if ! xdg-open "$LOG_FILE" 2>/dev/null; then
                 zenity --text-info --filename="$LOG_FILE" --title="Log File Viewer" --width=900 --height=700
             fi
             ;;
         "About This Installer") show_about_dialog ;;
         *)
-            # If the user selects Exit or closes the dialog, log the action and exit.
-            log "User selected exit or closed the dialog. Shutting down."
+            # If the user selects Exit or closes the dialog, log the action and exit gracefully.
+            log "User selected exit or closed the dialog. Shutting down the installer."
             exit 0
             ;;
     esac
@@ -565,7 +568,7 @@ main_menu() {
 
 # --- Script Entrypoint ---
 
-# Initialize the log file directory and the log file itself.
+# Initialize the log file directory and the log file itself upon script start.
 mkdir -p "$LOG_DIR"
 touch "$LOG_FILE"
 log "--- Kali NVIDIA Leviathan Installer session started ---"
@@ -575,8 +578,7 @@ log "--- Kali NVIDIA Leviathan Installer session started ---"
 _check_root
 _check_zenity
 
-# Enter the main application loop to display the menu and handle user actions.
+# Enter the main application loop to display the menu and handle user actions continuously.
 while true; do
     main_menu
 done
-  
