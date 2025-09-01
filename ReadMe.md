@@ -10,10 +10,6 @@ This is not just a script; it's a guided, self-aware system management tool that
 
 <br>
 
-![image](https://github.com/user-attachments/assets/1f94852c-47fc-4e4b-9e4a-57934ca44d03)
-
-
-
 ## Key Features of the Leviathan Edition
 
 The Leviathan Edition is a complete rewrite focusing on intelligence and safety:
@@ -56,7 +52,7 @@ To download and run the installer in a single, convenient command, open a termin
 > **Security Warning**: This method pipes a script from the internet directly into a root shell. This is a common practice for installers but carries a security risk. We recommend you inspect the script's source code before running.
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Opselon/Kali-LInux-Nvidia-Installer/main/kali-nvidia-installer-leviathan.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Opselon/Kali-LInux-Nvidia-Installer/main/nvidia-installer-kali.sh)"
 ```
 *(Note: Please replace the URL above with the raw URL to your final script file.)*
 
